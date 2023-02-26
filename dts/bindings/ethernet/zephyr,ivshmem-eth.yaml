@@ -1,0 +1,9 @@
+# Copyright (c) 2023 Enphase Energy
+# SPDX-License-Identifier: Apache-2.0
+
+description: IVSHMEM Ethernet
+
+compatible: "zephyr,ivshmem-eth"
+
+include:
+  - name: ethernet.yaml
