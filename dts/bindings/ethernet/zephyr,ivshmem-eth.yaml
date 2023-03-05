@@ -5,5 +5,4 @@ description: IVSHMEM Ethernet
 
 compatible: "zephyr,ivshmem-eth"
 
-include:
-  - name: ethernet.yaml
+include: [ethernet.yaml, pcie-device.yaml]

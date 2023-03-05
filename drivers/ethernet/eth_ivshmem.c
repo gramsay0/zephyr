@@ -17,10 +17,6 @@
 
 LOG_MODULE_REGISTER(eth_ivshmem, CONFIG_ETHERNET_LOG_LEVEL);
 
-#define PCI_VENDOR_ID_SIEMENS		0x110A
-#define PCI_DEVICE_ID_IVSHMEM		0x4106
-#define PCI_ID_SIEMENS_IVSHMEM		PCIE_ID(PCI_VENDOR_ID_SIEMENS, PCI_DEVICE_ID_IVSHMEM)
-
 #define PCIE_CONF_CMDSTAT_INTX_DISABLE	0x0400
 #define PCIE_CONF_INTR_PIN(x)		(((x) >> 8) & 0xFFu)
 #define PCIE_INTX_PIN_MIN		1
@@ -41,9 +37,6 @@ LOG_MODULE_REGISTER(eth_ivshmem, CONFIG_ETHERNET_LOG_LEVEL);
 #define IVSHMEM_CFG_ADDRESS		0x18
 
 #define IVSHMEM_INT_ENABLE		BIT(0)
-
-#define IVSHMEM_PROTO_UNDEFINED		0x0000
-#define IVSHMEM_PROTO_NET		0x0001
 
 #define ETH_IVSHMEM_STATE_RESET		0
 #define ETH_IVSHMEM_STATE_INIT		1
@@ -66,6 +59,7 @@ struct ivshmem_regs {
 };
 
 struct eth_ivshmem_dev_data {
+	struct pcie_dev *pcie;
 	struct net_if *iface;
 
 	volatile struct ivshmem_regs *ivshmem_regs;
@@ -302,28 +296,9 @@ static void eth_ivshmem_isr(const void *arg)
 static uint64_t pcie_conf_read_u64(pcie_bdf_t bdf, unsigned int reg)
 {
 	uint64_t lo = pcie_conf_read(bdf, reg);
-	uint64_t hi = pcie_conf_read(bdf, reg + sizeof(uint32_t)/4);
+	uint64_t hi = pcie_conf_read(bdf, reg + 1);
 
 	return hi << 32 | lo;
-}
-
-static bool eth_ivshmem_pci_lookup_cb(pcie_bdf_t bdf, pcie_id_t id, void *cb_data)
-{
-	struct pcie_dev *pci_dev = cb_data;
-
-	if (id != PCI_ID_SIEMENS_IVSHMEM) {
-		return true;
-	}
-
-	uint32_t class = pcie_conf_read(bdf, PCIE_CONF_CLASSREV);
-
-	if (PCIE_CONF_CLASSREV_PROGIF(class) != IVSHMEM_PROTO_NET) {
-		return true;
-	}
-
-	pci_dev->bdf = bdf;
-
-	return false;
 }
 
 int eth_ivshmem_initialize(const struct device *dev)
@@ -332,37 +307,28 @@ int eth_ivshmem_initialize(const struct device *dev)
 	const struct eth_ivshmem_cfg_data *cfg_data = dev->config;
 	int res;
 
-	struct pcie_dev pcie = {
-		.bdf = PCIE_BDF_NONE,
-		.id = PCI_ID_SIEMENS_IVSHMEM
-	};
-	struct pcie_scan_opt pcie_scan_opt = {
-		.cb = eth_ivshmem_pci_lookup_cb,
-		.cb_data = &pcie,
-		.flags = (PCIE_SCAN_RECURSIVE | PCIE_SCAN_CB_ALL),
-	};
-
-	pcie_scan(&pcie_scan_opt);
-
-	if (pcie.bdf == PCIE_BDF_NONE) {
+	if (dev_data->pcie->bdf == PCIE_BDF_NONE) {
 		LOG_ERR("Failed to find PCIe device");
 		return -ENODEV;
 	}
 
-	LOG_INF("PCIe: ID 0x%08X, BDF 0x%X", pcie.id, pcie.bdf);
+	LOG_INF("PCIe: ID 0x%08X, BDF 0x%X, class-rev 0x%08X",
+		dev_data->pcie->id, dev_data->pcie->bdf, dev_data->pcie->class_rev);
 
 	struct pcie_bar mbar_regs, mbar_msi_x, mbar_shmem;
 
-	if (!pcie_get_mbar(pcie.bdf, IVSHMEM_PCIE_REG_BAR_IDX, &mbar_regs)) {
+	if (!pcie_get_mbar(dev_data->pcie->bdf, IVSHMEM_PCIE_REG_BAR_IDX, &mbar_regs)) {
 		LOG_ERR("PCIe register bar not found");
 		return -EINVAL;
 	}
 
-	pcie_set_cmd(pcie.bdf, PCIE_CONF_CMDSTAT_MEM |
+	pcie_set_cmd(dev_data->pcie->bdf, PCIE_CONF_CMDSTAT_MEM |
 		PCIE_CONF_CMDSTAT_MASTER, true);
 
-	bool msi_x_bar_present = pcie_get_mbar(pcie.bdf, IVSHMEM_PCIE_MSI_X_BAR_IDX, &mbar_msi_x);
-	bool shmem_bar_present = pcie_get_mbar(pcie.bdf, IVSHMEM_PCIE_SHMEM_BAR_IDX, &mbar_shmem);
+	bool msi_x_bar_present = pcie_get_mbar(
+		dev_data->pcie->bdf, IVSHMEM_PCIE_MSI_X_BAR_IDX, &mbar_msi_x);
+	bool shmem_bar_present = pcie_get_mbar(
+		dev_data->pcie->bdf, IVSHMEM_PCIE_SHMEM_BAR_IDX, &mbar_shmem);
 
 	LOG_INF("MSI-X bar present: %s", msi_x_bar_present ? "yes" : "no");
 	LOG_INF("SHMEM bar present: %s", shmem_bar_present ? "yes" : "no");
@@ -386,7 +352,7 @@ int eth_ivshmem_initialize(const struct device *dev)
 	}
 	dev_data->peer_id = (dev_data->ivshmem_regs->id == 0) ? 1 : 0;
 
-	uint32_t vendor_cap = pcie_get_cap(pcie.bdf, PCI_CAP_ID_VNDR);
+	uint32_t vendor_cap = pcie_get_cap(dev_data->pcie->bdf, PCI_CAP_ID_VNDR);
 
 	uintptr_t shmem_phys_addr;
 	uint32_t cap_pos;
@@ -395,21 +361,21 @@ int eth_ivshmem_initialize(const struct device *dev)
 		shmem_phys_addr = mbar_shmem.phys_addr;
 	} else {
 		cap_pos = vendor_cap + IVSHMEM_CFG_ADDRESS / 4;
-		shmem_phys_addr = pcie_conf_read_u64(pcie.bdf, cap_pos);
+		shmem_phys_addr = pcie_conf_read_u64(dev_data->pcie->bdf, cap_pos);
 	}
 
 	cap_pos = vendor_cap + IVSHMEM_CFG_STATE_TAB_SZ / 4;
-	uint32_t state_table_size = pcie_conf_read(pcie.bdf, cap_pos);
+	uint32_t state_table_size = pcie_conf_read(dev_data->pcie->bdf, cap_pos);
 
 	LOG_INF("state_table_size 0x%X", state_table_size);
 
 	cap_pos = vendor_cap + IVSHMEM_CFG_RW_SECTION_SZ / 4;
-	uint64_t rw_section_size = pcie_conf_read_u64(pcie.bdf, cap_pos);
+	uint64_t rw_section_size = pcie_conf_read_u64(dev_data->pcie->bdf, cap_pos);
 
 	LOG_INF("rw_section_size 0x%llX", rw_section_size);
 
 	cap_pos = vendor_cap + IVSHMEM_CFG_OUTPUT_SECTION_SZ / 4;
-	uint64_t output_section_size = pcie_conf_read_u64(pcie.bdf, cap_pos);
+	uint64_t output_section_size = pcie_conf_read_u64(dev_data->pcie->bdf, cap_pos);
 
 	LOG_INF("output_section_size 0x%llX", output_section_size);
 
@@ -460,17 +426,17 @@ int eth_ivshmem_initialize(const struct device *dev)
 
 	/* Ensure one-shot ISR mode is disabled */
 	cap_pos = vendor_cap + IVSHMEM_CFG_PRIV_CNTL / 4;
-	uint32_t cfg_priv_cntl = pcie_conf_read(pcie.bdf, cap_pos);
+	uint32_t cfg_priv_cntl = pcie_conf_read(dev_data->pcie->bdf, cap_pos);
 
 	cfg_priv_cntl &= ~(IVSHMEM_PRIV_CNTL_ONESHOT_INT << ((IVSHMEM_CFG_PRIV_CNTL % 4) * 8));
-	pcie_conf_write(pcie.bdf, cap_pos, cfg_priv_cntl);
+	pcie_conf_write(dev_data->pcie->bdf, cap_pos, cfg_priv_cntl);
 
 	if (msi_x_bar_present) {
 		LOG_ERR("MSI-X not yet supported");
 		return -ENOTSUP;
 	}
 
-	uint32_t cfg_int = pcie_conf_read(pcie.bdf, PCIE_CONF_INTR);
+	uint32_t cfg_int = pcie_conf_read(dev_data->pcie->bdf, PCIE_CONF_INTR);
 	uint32_t cfg_intx_pin = PCIE_CONF_INTR_PIN(cfg_int);
 
 	if (!IN_RANGE(cfg_intx_pin, PCIE_INTX_PIN_MIN, PCIE_INTX_PIN_MAX)) {
@@ -479,19 +445,19 @@ int eth_ivshmem_initialize(const struct device *dev)
 	}
 
 	/* Ensure INTx is enabled */
-	pcie_set_cmd(pcie.bdf, PCIE_CONF_CMDSTAT_INTX_DISABLE, false);
+	pcie_set_cmd(dev_data->pcie->bdf, PCIE_CONF_CMDSTAT_INTX_DISABLE, false);
 
 	const struct intx_info *intx = &cfg_data->intx_info[cfg_intx_pin - 1];
 
 	LOG_INF("Enabling INTx IRQ %u (pin %u)", intx->irq, cfg_intx_pin);
 	if (!pcie_connect_dynamic_irq(
-			pcie.bdf, intx->irq, intx->priority,
+			dev_data->pcie->bdf, intx->irq, intx->priority,
 			eth_ivshmem_isr, dev, intx->flags)) {
 		LOG_ERR("Failed to connect INTx ISR %u", cfg_intx_pin);
 		return -EINVAL;
 	}
 
-	pcie_irq_enable(pcie.bdf, intx->irq);
+	pcie_irq_enable(dev_data->pcie->bdf, intx->irq);
 
 	dev_data->tx_rx_vector = 0;
 
@@ -575,7 +541,10 @@ static const struct ethernet_api eth_ivshmem_api = {
 
 #define ETH_IVSHMEM_INIT(inst)								\
 	ETH_IVSHMEM_GENERATE_MAC_ADDR(inst);						\
-	static struct eth_ivshmem_dev_data eth_ivshmem_dev_##inst = {};			\
+	DEVICE_PCIE_INST_DECLARE(inst);							\
+	static struct eth_ivshmem_dev_data eth_ivshmem_dev_##inst = {			\
+		DEVICE_PCIE_INST_INIT(inst, pcie),					\
+	};										\
 	static const struct eth_ivshmem_cfg_data eth_ivshmem_cfg_##inst = {		\
 		.name = "ivshmem_eth" STRINGIFY(inst),					\
 		.generate_mac_addr = generate_mac_addr_##inst,				\
