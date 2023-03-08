@@ -32,11 +32,19 @@
 			bus-range = <0x00 0x00>;
 		};
 	};
+
+	eth_ivshmem0: eth_ivshmem {
+		compatible = "zephyr,ivshmem-eth";
+		ivshmem-v2 = <&ivshmem0>;
+		zephyr,random-mac-address;
+		status = "okay";
+	};
 };
 
 &pcie {
-	eth_ivshmem0: eth_ivshmem@0 {
-		compatible = "zephyr,ivshmem-eth";
+	ivshmem0: ivshmem@0 {
+		compatible = "qemu,ivshmem";
+		ivshmem-v2;
 		vendor-id = <0x110A>;           /* Siemens */
 		device-id = <0x4106>;           /* IVSHMEM */
 		class-rev = <0xFF000100>;       /* PCI_CLASS_OTHERS | IVSHMEM_PROTO_NET */
@@ -44,7 +52,6 @@
 		interrupt-parent = <&pcie>;
 		interrupts = <1 2 3 4>;
 		reg = <0x00 0x00 0x00 0x00 0x01>;
-		zephyr,random-mac-address;
 		status = "okay";
 	};
 };

@@ -6,8 +6,7 @@
 
 #define DT_DRV_COMPAT zephyr_ivshmem_eth
 
-#include <zephyr/drivers/pcie/cap.h>
-#include <zephyr/drivers/pcie/pcie.h>
+#include <zephyr/drivers/virtualization/ivshmem.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/net/ethernet.h>
 #include <ethernet/eth_stats.h>
@@ -16,27 +15,6 @@
 #include "eth_ivshmem_priv.h"
 
 LOG_MODULE_REGISTER(eth_ivshmem, CONFIG_ETHERNET_LOG_LEVEL);
-
-#define PCIE_CONF_CMDSTAT_INTX_DISABLE	0x0400
-#define PCIE_CONF_INTR_PIN(x)		(((x) >> 8) & 0xFFu)
-#define PCIE_INTX_PIN_MIN		1
-#define PCIE_INTX_PIN_MAX		4
-
-#define IVSHMEM_PCIE_REG_BAR_IDX	0
-#define IVSHMEM_PCIE_MSI_X_BAR_IDX	1
-#define IVSHMEM_PCIE_SHMEM_BAR_IDX	2
-
-#define IVSHMEM_CFG_ID			0x00
-#define IVSHMEM_CFG_NEXT_CAP		0x01
-#define IVSHMEM_CFG_LENGTH		0x02
-#define IVSHMEM_CFG_PRIV_CNTL		0x03
-#define IVSHMEM_PRIV_CNTL_ONESHOT_INT	BIT(0)
-#define IVSHMEM_CFG_STATE_TAB_SZ	0x04
-#define IVSHMEM_CFG_RW_SECTION_SZ	0x08
-#define IVSHMEM_CFG_OUTPUT_SECTION_SZ	0x10
-#define IVSHMEM_CFG_ADDRESS		0x18
-
-#define IVSHMEM_INT_ENABLE		BIT(0)
 
 #define ETH_IVSHMEM_STATE_RESET		0
 #define ETH_IVSHMEM_STATE_INIT		1
@@ -50,24 +28,13 @@ static const char * const eth_ivshmem_state_names[] = {
 	[ETH_IVSHMEM_STATE_RUN] = "RUN"
 };
 
-struct ivshmem_regs {
-	uint32_t id;
-	uint32_t max_peers;
-	uint32_t int_control;
-	uint32_t doorbell;
-	uint32_t state;
-};
-
 struct eth_ivshmem_dev_data {
-	struct pcie_dev *pcie;
 	struct net_if *iface;
 
-	volatile struct ivshmem_regs *ivshmem_regs;
-	const volatile uint32_t *state_table;
 	uint32_t tx_rx_vector;
 	uint32_t peer_id;
 	uint8_t mac_addr[6];
-	struct k_sem int_sem;
+	struct k_poll_signal poll_signal;
 	struct eth_ivshmem_queue ivshmem_queue;
 
 	K_KERNEL_STACK_MEMBER(thread_stack, CONFIG_ETH_IVSHMEM_THREAD_STACK_SIZE);
@@ -80,13 +47,9 @@ struct eth_ivshmem_dev_data {
 };
 
 struct eth_ivshmem_cfg_data {
+	const struct device *ivshmem;
 	const char *name;
 	void (*generate_mac_addr)(uint8_t mac_addr[6]);
-	struct intx_info {
-		uint32_t irq;
-		uint32_t priority;
-		uint32_t flags;
-	} intx_info[PCIE_INTX_PIN_MAX];
 };
 
 #if defined(CONFIG_NET_STATISTICS_ETHERNET)
@@ -105,7 +68,7 @@ static int eth_ivshmem_start(const struct device *dev)
 	dev_data->enabled = true;
 
 	/* Wake up thread to check/update state */
-	k_sem_give(&dev_data->int_sem);
+	k_poll_signal_raise(&dev_data->poll_signal, 0);
 
 	return 0;
 }
@@ -117,7 +80,7 @@ static int eth_ivshmem_stop(const struct device *dev)
 	dev_data->enabled = false;
 
 	/* Wake up thread to check/update state */
-	k_sem_give(&dev_data->int_sem);
+	k_poll_signal_raise(&dev_data->poll_signal, 0);
 
 	return 0;
 }
@@ -131,6 +94,7 @@ static enum ethernet_hw_caps eth_ivshmem_caps(const struct device *dev)
 static int eth_ivshmem_send(const struct device *dev, struct net_pkt *pkt)
 {
 	struct eth_ivshmem_dev_data *dev_data = dev->data;
+	const struct eth_ivshmem_cfg_data *cfg_data = dev->config;
 	size_t len = net_pkt_get_len(pkt);
 
 	void *data;
@@ -151,15 +115,16 @@ static int eth_ivshmem_send(const struct device *dev, struct net_pkt *pkt)
 	res = eth_ivshmem_queue_tx_commit_buff(&dev_data->ivshmem_queue);
 	if (res == 0) {
 		/* Notify peer */
-		sys_write32(dev_data->tx_rx_vector | (dev_data->peer_id << 16),
-			(mem_addr_t)&dev_data->ivshmem_regs->doorbell);
+		ivshmem_int_peer(cfg_data->ivshmem, dev_data->peer_id, dev_data->tx_rx_vector);
 	}
 
 	return res;
 }
 
-static struct net_pkt *eth_ivshmem_rx(struct eth_ivshmem_dev_data *dev_data)
+static struct net_pkt *eth_ivshmem_rx(const struct device *dev)
 {
+	struct eth_ivshmem_dev_data *dev_data = dev->data;
+	const struct eth_ivshmem_cfg_data *cfg_data = dev->config;
 	const void *rx_data;
 	size_t rx_len;
 
@@ -190,32 +155,37 @@ static struct net_pkt *eth_ivshmem_rx(struct eth_ivshmem_dev_data *dev_data)
 dequeue:
 	if (eth_ivshmem_queue_rx_complete(&dev_data->ivshmem_queue) == 0) {
 		/* Notify peer */
-		sys_write32(dev_data->tx_rx_vector | (dev_data->peer_id << 16),
-			(mem_addr_t)&dev_data->ivshmem_regs->doorbell);
+		ivshmem_int_peer(cfg_data->ivshmem, dev_data->peer_id, dev_data->tx_rx_vector);
 	}
 
 	return pkt;
 }
 
-static void eth_ivshmem_set_state(struct eth_ivshmem_dev_data *dev_data, uint32_t state)
+static void eth_ivshmem_set_state(const struct device *dev, uint32_t state)
 {
+	struct eth_ivshmem_dev_data *dev_data = dev->data;
+	const struct eth_ivshmem_cfg_data *cfg_data = dev->config;
+
 	LOG_DBG("State update: %s -> %s",
 		eth_ivshmem_state_names[dev_data->state],
 		eth_ivshmem_state_names[state]);
 	dev_data->state = state;
-	sys_write32(dev_data->state, (mem_addr_t) &dev_data->ivshmem_regs->state);
+	ivshmem_set_state(cfg_data->ivshmem, state);
 }
 
-static void eth_ivshmem_state_update(struct eth_ivshmem_dev_data *dev_data)
+static void eth_ivshmem_state_update(const struct device *dev)
 {
-	uint32_t peer_state = sys_read32((mem_addr_t)&dev_data->state_table[dev_data->peer_id]);
+	struct eth_ivshmem_dev_data *dev_data = dev->data;
+	const struct eth_ivshmem_cfg_data *cfg_data = dev->config;
+
+	uint32_t peer_state = ivshmem_get_state(cfg_data->ivshmem, dev_data->peer_id);
 
 	switch (dev_data->state) {
 	case ETH_IVSHMEM_STATE_RESET:
 		switch (peer_state) {
 		case ETH_IVSHMEM_STATE_RESET:
 		case ETH_IVSHMEM_STATE_INIT:
-			eth_ivshmem_set_state(dev_data, ETH_IVSHMEM_STATE_INIT);
+			eth_ivshmem_set_state(dev, ETH_IVSHMEM_STATE_INIT);
 			break;
 		default:
 			/* Wait for peer to reset */
@@ -228,23 +198,23 @@ static void eth_ivshmem_state_update(struct eth_ivshmem_dev_data *dev_data)
 			break;
 		}
 		eth_ivshmem_queue_reset(&dev_data->ivshmem_queue);
-		eth_ivshmem_set_state(dev_data, ETH_IVSHMEM_STATE_READY);
+		eth_ivshmem_set_state(dev, ETH_IVSHMEM_STATE_READY);
 		break;
 	case ETH_IVSHMEM_STATE_READY:
 	case ETH_IVSHMEM_STATE_RUN:
 		switch (peer_state) {
 		case ETH_IVSHMEM_STATE_RESET:
 			net_eth_carrier_off(dev_data->iface);
-			eth_ivshmem_set_state(dev_data, ETH_IVSHMEM_STATE_RESET);
+			eth_ivshmem_set_state(dev, ETH_IVSHMEM_STATE_RESET);
 			break;
 		case ETH_IVSHMEM_STATE_READY:
 		case ETH_IVSHMEM_STATE_RUN:
 			if (dev_data->enabled && dev_data->state == ETH_IVSHMEM_STATE_READY) {
-				eth_ivshmem_set_state(dev_data, ETH_IVSHMEM_STATE_RUN);
+				eth_ivshmem_set_state(dev, ETH_IVSHMEM_STATE_RUN);
 				net_eth_carrier_on(dev_data->iface);
 			} else if (!dev_data->enabled && dev_data->state == ETH_IVSHMEM_STATE_RUN) {
 				net_eth_carrier_off(dev_data->iface);
-				eth_ivshmem_set_state(dev_data, ETH_IVSHMEM_STATE_RESET);
+				eth_ivshmem_set_state(dev, ETH_IVSHMEM_STATE_RESET);
 			}
 			break;
 		}
@@ -256,20 +226,28 @@ FUNC_NORETURN static void eth_ivshmem_thread(void *arg1, void *arg2, void *arg3)
 {
 	const struct device *dev = arg1;
 	struct eth_ivshmem_dev_data *dev_data = dev->data;
+	struct k_poll_event poll_event;
 
 	ARG_UNUSED(arg2);
 	ARG_UNUSED(arg3);
 
-	while (true) {
-		k_sem_take(&dev_data->int_sem, K_FOREVER);
+	k_poll_event_init(&poll_event,
+			  K_POLL_TYPE_SIGNAL,
+			  K_POLL_MODE_NOTIFY_ONLY,
+			  &dev_data->poll_signal);
 
-		eth_ivshmem_state_update(dev_data);
+	while (true) {
+		k_poll(&poll_event, 1, K_FOREVER);
+		poll_event.signal->signaled = 0;
+		poll_event.state = K_POLL_STATE_NOT_READY;
+
+		eth_ivshmem_state_update(dev);
 		if (dev_data->state != ETH_IVSHMEM_STATE_RUN) {
 			continue;
 		}
 
 		while (true) {
-			struct net_pkt *pkt = eth_ivshmem_rx(dev_data);
+			struct net_pkt *pkt = eth_ivshmem_rx(dev);
 
 			if (pkt == NULL) {
 				break;
@@ -285,115 +263,44 @@ FUNC_NORETURN static void eth_ivshmem_thread(void *arg1, void *arg2, void *arg3)
 	}
 }
 
-static void eth_ivshmem_isr(const void *arg)
-{
-	const struct device *dev = arg;
-	struct eth_ivshmem_dev_data *dev_data = dev->data;
-
-	k_sem_give(&dev_data->int_sem);
-}
-
-static uint64_t pcie_conf_read_u64(pcie_bdf_t bdf, unsigned int reg)
-{
-	uint64_t lo = pcie_conf_read(bdf, reg);
-	uint64_t hi = pcie_conf_read(bdf, reg + 1);
-
-	return hi << 32 | lo;
-}
-
 int eth_ivshmem_initialize(const struct device *dev)
 {
 	struct eth_ivshmem_dev_data *dev_data = dev->data;
 	const struct eth_ivshmem_cfg_data *cfg_data = dev->config;
 	int res;
 
-	if (dev_data->pcie->bdf == PCIE_BDF_NONE) {
-		LOG_ERR("Failed to find PCIe device");
+	k_poll_signal_init(&dev_data->poll_signal);
+
+	if (!device_is_ready(cfg_data->ivshmem)) {
+		LOG_ERR("ivshmem device not ready");
 		return -ENODEV;
 	}
 
-	LOG_INF("PCIe: ID 0x%08X, BDF 0x%X, class-rev 0x%08X",
-		dev_data->pcie->id, dev_data->pcie->bdf, dev_data->pcie->class_rev);
+	uint16_t protocol = ivshmem_get_protocol(cfg_data->ivshmem);
 
-	struct pcie_bar mbar_regs, mbar_msi_x, mbar_shmem;
-
-	if (!pcie_get_mbar(dev_data->pcie->bdf, IVSHMEM_PCIE_REG_BAR_IDX, &mbar_regs)) {
-		LOG_ERR("PCIe register bar not found");
+	if (protocol != IVSHMEM_V2_PROTO_NET) {
+		LOG_ERR("Invalid ivshmem protocol %hu", protocol);
 		return -EINVAL;
 	}
 
-	pcie_set_cmd(dev_data->pcie->bdf, PCIE_CONF_CMDSTAT_MEM |
-		PCIE_CONF_CMDSTAT_MASTER, true);
+	uint32_t id = ivshmem_get_id(cfg_data->ivshmem);
+	uint32_t max_peers = ivshmem_get_max_peers(cfg_data->ivshmem);
 
-	bool msi_x_bar_present = pcie_get_mbar(
-		dev_data->pcie->bdf, IVSHMEM_PCIE_MSI_X_BAR_IDX, &mbar_msi_x);
-	bool shmem_bar_present = pcie_get_mbar(
-		dev_data->pcie->bdf, IVSHMEM_PCIE_SHMEM_BAR_IDX, &mbar_shmem);
-
-	LOG_INF("MSI-X bar present: %s", msi_x_bar_present ? "yes" : "no");
-	LOG_INF("SHMEM bar present: %s", shmem_bar_present ? "yes" : "no");
-
-	z_phys_map((uint8_t **)&dev_data->ivshmem_regs,
-		mbar_regs.phys_addr, mbar_regs.size,
-		K_MEM_CACHE_WB | K_MEM_PERM_RW);
-
-	LOG_INF("Registers at 0x%lX (mapped to 0x%lX), size 0x%04zX",
-			mbar_regs.phys_addr, (uintptr_t)dev_data->ivshmem_regs, mbar_regs.size);
-
-	LOG_INF("ivshmem_regs: id %u, max_peers %u",
-		dev_data->ivshmem_regs->id, dev_data->ivshmem_regs->max_peers);
-	if (dev_data->ivshmem_regs->id > 1) {
-		LOG_ERR("Invalid ivshmem ID %u", dev_data->ivshmem_regs->id);
+	LOG_INF("ivshmem: id %u, max_peers %u", id, max_peers);
+	if (id > 1) {
+		LOG_ERR("Invalid ivshmem ID %u", id);
 		return -EINVAL;
 	}
-	if (dev_data->ivshmem_regs->max_peers != 2) {
-		LOG_ERR("Invalid ivshmem max peers %u", dev_data->ivshmem_regs->max_peers);
+	if (max_peers != 2) {
+		LOG_ERR("Invalid ivshmem max peers %u", max_peers);
 		return -EINVAL;
 	}
-	dev_data->peer_id = (dev_data->ivshmem_regs->id == 0) ? 1 : 0;
+	dev_data->peer_id = (id == 0) ? 1 : 0;
 
-	uint32_t vendor_cap = pcie_get_cap(dev_data->pcie->bdf, PCI_CAP_ID_VNDR);
-
-	uintptr_t shmem_phys_addr;
-	uint32_t cap_pos;
-
-	if (shmem_bar_present) {
-		shmem_phys_addr = mbar_shmem.phys_addr;
-	} else {
-		cap_pos = vendor_cap + IVSHMEM_CFG_ADDRESS / 4;
-		shmem_phys_addr = pcie_conf_read_u64(dev_data->pcie->bdf, cap_pos);
-	}
-
-	cap_pos = vendor_cap + IVSHMEM_CFG_STATE_TAB_SZ / 4;
-	uint32_t state_table_size = pcie_conf_read(dev_data->pcie->bdf, cap_pos);
-
-	LOG_INF("state_table_size 0x%X", state_table_size);
-
-	cap_pos = vendor_cap + IVSHMEM_CFG_RW_SECTION_SZ / 4;
-	uint64_t rw_section_size = pcie_conf_read_u64(dev_data->pcie->bdf, cap_pos);
-
-	LOG_INF("rw_section_size 0x%llX", rw_section_size);
-
-	cap_pos = vendor_cap + IVSHMEM_CFG_OUTPUT_SECTION_SZ / 4;
-	uint64_t output_section_size = pcie_conf_read_u64(dev_data->pcie->bdf, cap_pos);
-
-	LOG_INF("output_section_size 0x%llX", output_section_size);
-
-	uintptr_t shmem_addr;
-	size_t shmem_size = state_table_size + rw_section_size + 2 * output_section_size;
-
-	z_phys_map((uint8_t **)&shmem_addr,
-		shmem_phys_addr, shmem_size,
-		K_MEM_CACHE_WB | K_MEM_PERM_RW);
-
-	LOG_INF("Shared memory at 0x%lX (mapped to 0x%lX), size 0x%04zX",
-		shmem_phys_addr, shmem_addr, shmem_size);
-
-	dev_data->state_table = (void *)shmem_addr;
-
-	uintptr_t output_section_addr = shmem_addr + state_table_size + rw_section_size;
-	/* ID 0 outputs to the first shmem section, ID 1 to the second */
-	bool tx_buffer_first = dev_data->ivshmem_regs->id == 0;
+	bool tx_buffer_first = id == 0;
+	uintptr_t output_section_addr;
+	size_t output_section_size = ivshmem_get_output_mem_section(
+		cfg_data->ivshmem, 0, &output_section_addr);
 
 	res = eth_ivshmem_queue_init(
 		&dev_data->ivshmem_queue, output_section_addr,
@@ -402,12 +309,25 @@ int eth_ivshmem_initialize(const struct device *dev)
 		LOG_ERR("Failed to init ivshmem queue");
 		return res;
 	}
-	LOG_INF("shmem queue: desc_len 0x%hX, header size 0x%X, data size 0x%X",
+	LOG_INF("shmem queue: desc len 0x%hX, header size 0x%X, data size 0x%X",
 		dev_data->ivshmem_queue.desc_max_len,
 		dev_data->ivshmem_queue.vring_header_size,
 		dev_data->ivshmem_queue.vring_data_max_len);
 
-	k_sem_init(&dev_data->int_sem, 0, 1);
+	uint16_t n_vectors = ivshmem_get_vectors(cfg_data->ivshmem);
+
+	/* For simplicity, state and TX/RX vectors do the same thing */
+	ivshmem_register_handler(cfg_data->ivshmem, &dev_data->poll_signal, 0);
+	dev_data->tx_rx_vector = 0;
+	if (n_vectors == 0) {
+		LOG_ERR("Error no ivshmem ISR vectors");
+		return -EINVAL;
+	} else if (n_vectors > 1) {
+		ivshmem_register_handler(cfg_data->ivshmem, &dev_data->poll_signal, 1);
+		dev_data->tx_rx_vector = 1;
+	}
+
+	ivshmem_set_state(cfg_data->ivshmem, ETH_IVSHMEM_STATE_RESET);
 
 	cfg_data->generate_mac_addr(dev_data->mac_addr);
 	LOG_INF("MAC Address %02X:%02X:%02X:%02X:%02X:%02X",
@@ -424,50 +344,10 @@ int eth_ivshmem_initialize(const struct device *dev)
 		K_ESSENTIAL, K_NO_WAIT);
 	k_thread_name_set(tid, cfg_data->name);
 
-	/* Ensure one-shot ISR mode is disabled */
-	cap_pos = vendor_cap + IVSHMEM_CFG_PRIV_CNTL / 4;
-	uint32_t cfg_priv_cntl = pcie_conf_read(dev_data->pcie->bdf, cap_pos);
-
-	cfg_priv_cntl &= ~(IVSHMEM_PRIV_CNTL_ONESHOT_INT << ((IVSHMEM_CFG_PRIV_CNTL % 4) * 8));
-	pcie_conf_write(dev_data->pcie->bdf, cap_pos, cfg_priv_cntl);
-
-	if (msi_x_bar_present) {
-		LOG_ERR("MSI-X not yet supported");
-		return -ENOTSUP;
-	}
-
-	uint32_t cfg_int = pcie_conf_read(dev_data->pcie->bdf, PCIE_CONF_INTR);
-	uint32_t cfg_intx_pin = PCIE_CONF_INTR_PIN(cfg_int);
-
-	if (!IN_RANGE(cfg_intx_pin, PCIE_INTX_PIN_MIN, PCIE_INTX_PIN_MAX)) {
-		LOG_ERR("Invalid INTx pin %u", cfg_intx_pin);
-		return -EINVAL;
-	}
-
-	/* Ensure INTx is enabled */
-	pcie_set_cmd(dev_data->pcie->bdf, PCIE_CONF_CMDSTAT_INTX_DISABLE, false);
-
-	const struct intx_info *intx = &cfg_data->intx_info[cfg_intx_pin - 1];
-
-	LOG_INF("Enabling INTx IRQ %u (pin %u)", intx->irq, cfg_intx_pin);
-	if (!pcie_connect_dynamic_irq(
-			dev_data->pcie->bdf, intx->irq, intx->priority,
-			eth_ivshmem_isr, dev, intx->flags)) {
-		LOG_ERR("Failed to connect INTx ISR %u", cfg_intx_pin);
-		return -EINVAL;
-	}
-
-	pcie_irq_enable(dev_data->pcie->bdf, intx->irq);
-
-	dev_data->tx_rx_vector = 0;
-
-	eth_ivshmem_set_state(dev_data, ETH_IVSHMEM_STATE_RESET);
-
-	sys_write32(IVSHMEM_INT_ENABLE,
-		    (mem_addr_t)&dev_data->ivshmem_regs->int_control);
+	ivshmem_enable_interrupts(cfg_data->ivshmem, true);
 
 	/* Wake up thread to check/update state */
-	k_sem_give(&dev_data->int_sem);
+	k_poll_signal_raise(&dev_data->poll_signal, 0);
 
 	return 0;
 }
@@ -492,7 +372,7 @@ static void eth_ivshmem_iface_init(struct net_if *iface)
 	net_if_carrier_off(iface);
 
 	/* Wake up thread to check/update state */
-	k_sem_give(&dev_data->int_sem);
+	k_poll_signal_raise(&dev_data->poll_signal, 0);
 }
 
 static const struct ethernet_api eth_ivshmem_api = {
@@ -505,12 +385,6 @@ static const struct ethernet_api eth_ivshmem_api = {
 	.get_capabilities	= eth_ivshmem_caps,
 	.send			= eth_ivshmem_send,
 };
-
-#define ETH_IVSHMEM_INTX_INFO(intx_idx, drv_idx) {					\
-		.irq = DT_IRQ_BY_IDX(DT_DRV_INST(drv_idx), intx_idx, irq),		\
-		.priority = DT_IRQ_BY_IDX(DT_DRV_INST(drv_idx), intx_idx, priority),	\
-		.flags = DT_IRQ_BY_IDX(DT_DRV_INST(drv_idx), intx_idx, flags),		\
-	}
 
 #define ETH_IVSHMEM_RANDOM_MAC_ADDR(inst)						\
 	static void generate_mac_addr_##inst(uint8_t mac_addr[6])			\
@@ -541,15 +415,11 @@ static const struct ethernet_api eth_ivshmem_api = {
 
 #define ETH_IVSHMEM_INIT(inst)								\
 	ETH_IVSHMEM_GENERATE_MAC_ADDR(inst);						\
-	DEVICE_PCIE_INST_DECLARE(inst);							\
-	static struct eth_ivshmem_dev_data eth_ivshmem_dev_##inst = {			\
-		DEVICE_PCIE_INST_INIT(inst, pcie),					\
-	};										\
+	static struct eth_ivshmem_dev_data eth_ivshmem_dev_##inst = {};			\
 	static const struct eth_ivshmem_cfg_data eth_ivshmem_cfg_##inst = {		\
+		.ivshmem = DEVICE_DT_GET(DT_INST_PHANDLE(inst, ivshmem_v2)),		\
 		.name = "ivshmem_eth" STRINGIFY(inst),					\
 		.generate_mac_addr = generate_mac_addr_##inst,				\
-		.intx_info =								\
-		{ FOR_EACH_FIXED_ARG(ETH_IVSHMEM_INTX_INFO, (,), inst, 0, 1, 2, 3) }	\
 	};										\
 	ETH_NET_DEVICE_DT_INST_DEFINE(inst,						\
 				      eth_ivshmem_initialize,				\

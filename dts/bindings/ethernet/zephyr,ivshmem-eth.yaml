@@ -5,4 +5,11 @@ description: IVSHMEM Ethernet
 
 compatible: "zephyr,ivshmem-eth"
 
-include: [ethernet.yaml, pcie-device.yaml]
+include: ethernet.yaml
+
+properties:
+
+  ivshmem-v2:
+    type: phandle
+    required: true
+    description: ivshmem-v2 driver node
