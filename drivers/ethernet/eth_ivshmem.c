@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#define DT_DRV_COMPAT zephyr_ivshmem_eth
+#define DT_DRV_COMPAT siemens_ivshmem_eth
 
 #include <zephyr/drivers/virtualization/ivshmem.h>
 #include <zephyr/logging/log.h>

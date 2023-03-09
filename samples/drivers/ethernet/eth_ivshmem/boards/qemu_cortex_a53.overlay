@@ -34,7 +34,7 @@
 	};
 
 	eth_ivshmem0: eth_ivshmem {
-		compatible = "zephyr,ivshmem-eth";
+		compatible = "siemens,ivshmem-eth";
 		ivshmem-v2 = <&ivshmem0>;
 		zephyr,random-mac-address;
 		status = "okay";

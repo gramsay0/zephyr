@@ -3,7 +3,7 @@
 
 description: IVSHMEM Ethernet
 
-compatible: "zephyr,ivshmem-eth"
+compatible: "siemens,ivshmem-eth"
 
 include: ethernet.yaml
 
